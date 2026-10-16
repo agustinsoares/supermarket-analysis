@@ -1,6 +1,14 @@
-import { CHAINS, HOME, STORE_RADIUS_KM } from "./config";
+import { AUTO_CHAINS, HOME, STORE_CHAINS, STORE_RADIUS_KM } from "./config";
 import { nearbyStores, searchProducts, type KassalProduct } from "./kassal";
 import { db } from "./supabase";
+
+function toGrams(weight: number | null, unit: string | null): number | null {
+  if (weight == null) return null;
+  const u = (unit ?? "").toLowerCase();
+  if (u === "g") return Math.round(weight);
+  if (u === "kg") return Math.round(weight * 1000);
+  return null;
+}
 
 function toRow(p: KassalProduct, chain: string) {
   const cats = p.category ?? [];
@@ -17,6 +25,7 @@ function toRow(p: KassalProduct, chain: string) {
     url: p.url,
     weight: p.weight,
     weight_unit: p.weight_unit,
+    grams: toGrams(p.weight, p.weight_unit),
     current_price: p.current_price,
     current_unit_price: p.current_unit_price,
     price_updated_at: new Date().toISOString(),
@@ -29,17 +38,22 @@ export async function syncTerm(term: string) {
   const sb = db();
   const result: { chain: string; seen: number; changes: number; error?: string }[] = [];
 
-  for (const chain of CHAINS) {
+  for (const chain of AUTO_CHAINS) {
     let seen = 0;
     let changes = 0;
     let error: string | undefined;
     try {
-      const products = (await searchProducts(term, chain.code)).filter((p) => p.current_price != null);
+      const found = (await searchProducts(term, chain.code)).filter((p) => p.current_price != null);
+      const ids = found.map((p) => p.id);
+      const { data: before, error: e1 } = ids.length
+        ? await sb.from("items").select("id,current_price,locked").in("id", ids)
+        : { data: [], error: null };
+      if (e1) throw e1;
+      // Los productos editados a mano (locked) no se pisan con los datos de Kassalapp.
+      const locked = new Set((before ?? []).filter((r) => r.locked).map((r) => r.id as number));
+      const products = found.filter((p) => !locked.has(p.id));
       seen = products.length;
       if (seen) {
-        const ids = products.map((p) => p.id);
-        const { data: before, error: e1 } = await sb.from("items").select("id,current_price").in("id", ids);
-        if (e1) throw e1;
         const prev = new Map((before ?? []).map((r) => [r.id as number, r.current_price as number | null]));
 
         const { error: e2 } = await sb.from("items").upsert(products.map((p) => toRow(p, chain.code)));
@@ -67,8 +81,8 @@ export async function syncTerm(term: string) {
 export async function syncStores() {
   const sb = db();
   let total = 0;
-  for (const chain of CHAINS) {
-    const stores = await nearbyStores(chain.storeGroup, HOME.lat, HOME.lng, STORE_RADIUS_KM);
+  for (const chain of STORE_CHAINS) {
+    const stores = await nearbyStores(chain.storeGroup as string, HOME.lat, HOME.lng, STORE_RADIUS_KM);
     const rows = stores.map((s) => ({
       id: s.id,
       chain: s.group,
