@@ -1,4 +1,5 @@
 import FlyersView, { type Flyer } from "@/components/FlyersView";
+import { activeProvider } from "@/lib/llm";
 import { db } from "@/lib/supabase";
 
 export const dynamic = "force-dynamic";
@@ -10,5 +11,5 @@ export default async function FlyersPage() {
     .order("created_at", { ascending: false })
     .limit(50);
   if (error) return <div className="card err">No se pudo leer la base de datos: {error.message}</div>;
-  return <FlyersView initial={(data ?? []) as Flyer[]} />;
+  return <FlyersView initial={(data ?? []) as Flyer[]} ai={activeProvider()} />;
 }

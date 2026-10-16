@@ -22,7 +22,9 @@ const STATUS: Record<Flyer["status"], { label: string; cls: string }> = {
 
 const isStale = (f: Flyer) => f.status === "analyzing" && Date.now() - new Date(f.updated_at).getTime() > 3 * 60 * 1000;
 
-export default function FlyersView({ initial }: { initial: Flyer[] }) {
+const PROVIDER_LABEL = { gemini: "Gemini", anthropic: "Claude" } as const;
+
+export default function FlyersView({ initial, ai }: { initial: Flyer[]; ai: { provider: "gemini" | "anthropic"; model: string } | null }) {
   const [flyers, setFlyers] = useState(initial);
   const [chain, setChain] = useState("REMA_1000");
   const [title, setTitle] = useState("");
@@ -32,6 +34,21 @@ export default function FlyersView({ initial }: { initial: Flyer[] }) {
   const [progress, setProgress] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [aiTest, setAiTest] = useState("");
+  const [testing, setTesting] = useState(false);
+
+  async function testAi() {
+    setTesting(true);
+    setAiTest("");
+    try {
+      const r = await api<{ ok: boolean; provider: "gemini" | "anthropic"; model: string; error?: string }>("/api/ai-check", { method: "POST" });
+      setAiTest(r.ok ? `✓ ${PROVIDER_LABEL[r.provider]} (${r.model}) responde bien.` : `✗ ${r.error ?? "No responde"}`);
+    } catch (err) {
+      setAiTest(`✗ ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setTesting(false);
+    }
+  }
 
   const refresh = useCallback(async () => {
     try {
@@ -80,7 +97,7 @@ export default function FlyersView({ initial }: { initial: Flyer[] }) {
       });
       setTitle(""); setValidFrom(""); setValidTo(""); setFiles([]);
       (document.getElementById("flyer-files") as HTMLInputElement | null)?.value && ((document.getElementById("flyer-files") as HTMLInputElement).value = "");
-      setProgress("Folleto subido. Pulsa «Analizar con Claude».");
+      setProgress("Folleto subido. Pulsa «Analizar con IA».");
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -116,7 +133,14 @@ export default function FlyersView({ initial }: { initial: Flyer[] }) {
       <div className="page-head">
         <div>
           <h1>Folletos</h1>
-          <p className="muted">Sube un folleto y Claude lee las ofertas. Tú revisas antes de que cuenten en la comparación.</p>
+          <p className="muted">Sube un folleto y la IA lee las ofertas. Tú revisas antes de que cuenten en la comparación.</p>
+        </div>
+        <div style={{ textAlign: "right" }}>
+          <div className="row" style={{ justifyContent: "flex-end" }}>
+            <span className={`tag ${ai ? "ok" : "bad"}`}>{ai ? `IA: ${PROVIDER_LABEL[ai.provider]} · ${ai.model}` : "IA sin configurar"}</span>
+            <button type="button" className="btn small" disabled={testing || !ai} onClick={testAi}>{testing ? "Probando…" : "Probar IA"}</button>
+          </div>
+          {aiTest && <p className={aiTest.startsWith("✓") ? "ok" : "err"} style={{ marginTop: 6 }}>{aiTest}</p>}
         </div>
       </div>
 
@@ -181,7 +205,7 @@ export default function FlyersView({ initial }: { initial: Flyer[] }) {
             )}
             {f.error && <p className="err">{f.error}</p>}
             <div className="row">
-              {(f.status === "uploaded") && <button className="btn primary small" onClick={() => analyze(f, false)}>Analizar con Claude</button>}
+              {(f.status === "uploaded") && <button className="btn primary small" onClick={() => analyze(f, false)}>Analizar con IA</button>}
               {(f.status === "error" || stale) && <button className="btn primary small" onClick={() => analyze(f, false)}>Reanudar</button>}
               {(f.status === "review" || f.status === "done" || f.status === "error") && (
                 <button className="btn small" onClick={() => confirm("Se vuelve a leer todo el folleto y se reemplazan los borradores. ¿Seguir?") && analyze(f, true)}>Volver a analizar</button>

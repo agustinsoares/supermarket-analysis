@@ -1,47 +1,16 @@
-import Anthropic from "@anthropic-ai/sdk";
-import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import { PDFDocument } from "pdf-lib";
-import { z } from "zod";
 import { CATEGORIES } from "./config";
+import { extractProducts, type Doc } from "./llm";
 import { pricePerKg } from "./product";
 import { downloadFromBucket, FLYER_BUCKET } from "./storage";
 import { db } from "./supabase";
 
-const MODEL = process.env.ANTHROPIC_MODEL || "claude-opus-5-5";
 const PDF_PAGES_PER_UNIT = 3;
 
 type FlyerFile = { path: string; mime: string; name?: string };
 type Unit =
   | { file: number; kind: "image" }
   | { file: number; kind: "pdf"; from: number; to: number }; // páginas base 0, [from, to)
-
-const FlyerProduct = z.object({
-  name: z.string(),
-  brand: z.string().nullable(),
-  price: z.number(),
-  grams: z.number().nullable(),
-  category: z.string(), // el SDK no convierte z.enum en restricción: se normaliza en el servidor
-  notes: z.string().nullable(),
-  valid_from: z.string().nullable(),
-  valid_to: z.string().nullable(),
-});
-const FlyerExtraction = z.object({ products: z.array(FlyerProduct) });
-
-const SYSTEM = `Eres un asistente que lee folletos de supermercados noruegos (Rema 1000, Kiwi, Coop Extra) y extrae las ofertas como datos.
-
-Reglas:
-- Extrae solo productos con un precio claro en NOK (kr). Ignora recetas, publicidad, textos legales y productos sin precio.
-- name: nombre del producto tal como aparece, sin la marca si va aparte y sin el tamaño. brand: marca (null si no hay).
-- price: lo que paga el cliente por UNA unidad del producto, como número (ej. 29.9). Si el folleto da "2 for 50", usa 25 y anótalo en notes. Si la oferta es solo para miembros o con la app (Trumf, Coop-medlem, REMA-appen), anótalo en notes.
-- grams: peso o volumen del envase en gramos (1 kg = 1000, 1 L = 1000, 1 dl = 100, 1 stk de peso desconocido = null). Si el precio es por kilo sin envase fijo, grams = 1000 y notes = "pris per kg".
-- category: elige exactamente una de estas categorías: ${CATEGORIES.join(" | ")}. Si ninguna encaja, "Otros".
-- valid_from / valid_to: fechas YYYY-MM-DD solo si el folleto las indica para ese producto o para la página; si no, null.
-- No inventes datos. Si un dato no se ve, usa null. Si hay dudas sobre el precio, omite el producto.`;
-
-function client() {
-  if (!process.env.ANTHROPIC_API_KEY) throw new Error("Falta ANTHROPIC_API_KEY en las variables de entorno");
-  return new Anthropic();
-}
 
 async function buildPlan(files: FlyerFile[]): Promise<Unit[]> {
   const units: Unit[] = [];
@@ -59,37 +28,16 @@ async function buildPlan(files: FlyerFile[]): Promise<Unit[]> {
   return units;
 }
 
-async function unitContent(file: FlyerFile, unit: Unit): Promise<Anthropic.Beta.Messages.BetaContentBlockParam> {
+async function loadUnit(file: FlyerFile, unit: Unit): Promise<Doc> {
   const bytes = await downloadFromBucket(FLYER_BUCKET, file.path);
   if (unit.kind === "pdf") {
     const src = await PDFDocument.load(bytes, { ignoreEncryption: true });
     const out = await PDFDocument.create();
     const pages = await out.copyPages(src, Array.from({ length: unit.to - unit.from }, (_, k) => unit.from + k));
     pages.forEach((p) => out.addPage(p));
-    const data = Buffer.from(await out.save()).toString("base64");
-    return { type: "document", source: { type: "base64", media_type: "application/pdf", data } };
+    return { mime: "application/pdf", base64: Buffer.from(await out.save()).toString("base64") };
   }
-  return {
-    type: "image",
-    source: { type: "base64", media_type: file.mime as "image/jpeg" | "image/png" | "image/webp", data: bytes.toString("base64") },
-  };
-}
-
-async function extractUnit(content: Anthropic.Beta.Messages.BetaContentBlockParam, context: string) {
-  const res = await client().beta.messages.parse({
-    model: MODEL,
-    max_tokens: 16000,
-    betas: ["server-side-fallback-2026-07-01"],
-    fallbacks: "default",
-    system: SYSTEM,
-    output_config: { effort: "medium", format: zodOutputFormat(FlyerExtraction) },
-    messages: [
-      { role: "user", content: [content, { type: "text", text: `${context}\n\nExtrae todos los productos con precio de estas páginas.` }] },
-    ],
-  });
-  if (res.stop_reason === "refusal") throw new Error("Claude rechazó leer esta página");
-  if (!res.parsed_output) throw new Error(`Respuesta incompleta (${res.stop_reason}); prueba con menos páginas`);
-  return res.parsed_output.products;
+  return { mime: file.mime, base64: bytes.toString("base64") };
 }
 
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -131,7 +79,7 @@ export async function analyzeFlyer(flyerId: number) {
 
     for (let i = done; i < plan.length; i++) {
       const unit = plan[i];
-      const products = await extractUnit(await unitContent(files[unit.file], unit), context);
+      const products = await extractProducts(await loadUnit(files[unit.file], unit), context);
 
       const seen = new Set<string>();
       const rows = products
@@ -141,18 +89,19 @@ export async function analyzeFlyer(flyerId: number) {
           return seen.has(k) ? false : (seen.add(k), true);
         })
         .map((p) => {
-          const grams = p.grams && p.grams > 0 ? Math.round(p.grams) : null;
+          const grams = p.grams > 0 ? Math.round(p.grams) : null;
+          const date = (v: string) => (DATE.test(v) ? v : null);
           return {
             chain: flyer.chain,
             name: p.name.trim().slice(0, 200),
-            brand: p.brand?.trim().slice(0, 100) || null,
+            brand: p.brand.trim().slice(0, 100) || null,
             category: normalizeCategory(p.category),
             grams,
             current_price: p.price,
             current_unit_price: pricePerKg(p.price, grams),
-            notes: p.notes?.trim().slice(0, 300) || null,
-            valid_from: p.valid_from && DATE.test(p.valid_from) ? p.valid_from : flyer.valid_from,
-            valid_to: p.valid_to && DATE.test(p.valid_to) ? p.valid_to : flyer.valid_to,
+            notes: p.notes.trim().slice(0, 300) || null,
+            valid_from: date(p.valid_from) ?? flyer.valid_from,
+            valid_to: date(p.valid_to) ?? flyer.valid_to,
             source: "flyer",
             status: "draft",
             flyer_id: flyerId,

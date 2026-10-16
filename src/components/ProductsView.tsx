@@ -47,7 +47,7 @@ export default function ProductsView({ items, draftFlyerId, isDraftView }: { ite
 
       {isDraftView && items.length > 0 && (
         <div className="banner" style={{ marginBottom: 16 }}>
-          <span>Leídos por Claude desde folletos. Revisa y edita lo que haga falta antes de aprobar.</span>
+          <span>Leídos por la IA desde folletos. Revisa y edita lo que haga falta antes de aprobar.</span>
           <span className="row">
             <button className="btn primary small" disabled={busy} onClick={() => bulk("approve", draftIds)}>Aprobar {draftIds.length}</button>
             <button className="btn danger small" disabled={busy}

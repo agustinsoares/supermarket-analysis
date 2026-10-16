@@ -1,6 +1,7 @@
 import { NextResponse, after } from "next/server";
 import { isAuthorized } from "@/lib/auth";
 import { analyzeFlyer } from "@/lib/flyer-ai";
+import { activeProvider, NO_KEY_MESSAGE } from "@/lib/llm";
 import { db } from "@/lib/supabase";
 
 // El análisis sigue en segundo plano después de responder; la web consulta el progreso.
@@ -13,9 +14,7 @@ export async function POST(req: Request, { params }: Ctx) {
   if (!(await isAuthorized(req))) return NextResponse.json({ error: "No autorizado" }, { status: 401 });
   const id = Number((await params).id);
   if (!Number.isSafeInteger(id) || id <= 0) return NextResponse.json({ error: "Id inválido" }, { status: 400 });
-  if (!process.env.ANTHROPIC_API_KEY) {
-    return NextResponse.json({ error: "Falta ANTHROPIC_API_KEY en Vercel para que Claude pueda leer folletos" }, { status: 500 });
-  }
+  if (!activeProvider()) return NextResponse.json({ error: NO_KEY_MESSAGE }, { status: 500 });
 
   const sb = db();
   const { data: flyer } = await sb.from("flyers").select("status,updated_at").eq("id", id).maybeSingle();
