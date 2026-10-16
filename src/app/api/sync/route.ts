@@ -7,7 +7,7 @@ export const maxDuration = 60;
 // POST { "term": "lettmelk" }  -> busca ese término en Rema, Kiwi y Coop
 // POST { "stores": true }      -> actualiza las tiendas físicas cercanas
 export async function POST(req: Request) {
-  if (!isAuthorized(req)) return NextResponse.json({ error: "No autorizado" }, { status: 401 });
+  if (!(await isAuthorized(req))) return NextResponse.json({ error: "No autorizado" }, { status: 401 });
   const body = (await req.json().catch(() => ({}))) as { term?: string; stores?: boolean };
   try {
     if (body.stores) return NextResponse.json({ stores: await syncStores() });
