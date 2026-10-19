@@ -110,9 +110,35 @@ function cleanApiMessage(e: unknown): string {
   }
 }
 
+/** Segundos de espera que sugiere Google en «Please retry in 17h11m49s» (null si no lo dice). */
+function retryDelaySeconds(msg: string): number | null {
+  const m = msg.match(/retry in\s+(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:([\d.]+)s)?/i);
+  if (!m) return null;
+  const secs = (Number(m[1]) || 0) * 3600 + (Number(m[2]) || 0) * 60 + (Number(m[3]) || 0);
+  return secs > 0 ? secs : null;
+}
+
+const humanWait = (secs: number) => (secs >= 3600 ? `${Math.round(secs / 3600)} h` : secs >= 90 ? `${Math.round(secs / 60)} min` : `${Math.round(secs)} s`);
+
+/** Cuota diaria agotada: esperar unos segundos no sirve, hay que parar y avisar. */
+function isDailyQuota(msg: string): boolean {
+  return /PerDay|per day/i.test(msg) || (retryDelaySeconds(msg) ?? 0) > 120;
+}
+
+function quotaError(model: string, msg: string): Error {
+  const limit = msg.match(/limit:\s*(\d+)/)?.[1];
+  const wait = retryDelaySeconds(msg);
+  return new Error(
+    `Cuota gratuita de Gemini agotada para «${model}»${limit ? ` (límite: ${limit} peticiones)` : ""}` +
+      `${wait ? `; se renueva en ~${humanWait(wait)}` : ""}. ` +
+      `Opciones: esperar y pulsar «Reanudar», activar facturación en Google AI Studio, probar otro modelo en GEMINI_MODEL, o usar ANTHROPIC_API_KEY.`,
+  );
+}
+
 /** Convierte un error de Gemini en uno útil; si el modelo no existe, lista los que sí tiene tu clave. */
 async function geminiFailure(e: unknown, model: string): Promise<Error> {
   const msg = cleanApiMessage(e);
+  if (e instanceof ApiError && e.status === 429 && isDailyQuota(msg)) return quotaError(model, msg);
   if (e instanceof ApiError && e.status === 404) {
     let hint = "";
     try {
@@ -154,9 +180,12 @@ async function viaGemini(model: string, doc: Doc, prompt: string): Promise<RawPr
       return parse(res.text);
     } catch (e) {
       // Límite de peticiones o sobrecarga: reintenta con espera (cuota gratuita baja).
-      const retryable = e instanceof ApiError && (e.status === 429 || e.status === 503);
-      if (!retryable || attempt >= 4) throw e instanceof ApiError ? await geminiFailure(e, model) : e;
-      await sleep(attempt * 20_000);
+      if (!(e instanceof ApiError)) throw e;
+      const msg = cleanApiMessage(e);
+      const retryable = (e.status === 429 && !isDailyQuota(msg)) || e.status === 503;
+      if (!retryable || attempt >= 4) throw await geminiFailure(e, model);
+      const wait = retryDelaySeconds(msg);
+      await sleep(Math.min(wait ? wait + 1 : attempt * 20, 90) * 1000);
     }
   }
 }
