@@ -1,6 +1,9 @@
+import { cookies } from "next/headers";
 import NavLinks from "@/components/NavLinks";
+import { COOKIE, usernameFromCookie } from "@/lib/session";
 
-export default function AppLayout({ children }: { children: React.ReactNode }) {
+export default async function AppLayout({ children }: { children: React.ReactNode }) {
+  const user = usernameFromCookie((await cookies()).get(COOKIE)?.value); // el middleware ya verificó la firma
   return (
     <>
       <header className="topbar">
@@ -10,7 +13,8 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
             <span className="name">Supermarket</span>
           </a>
           <NavLinks />
-          <form className="logout" action="/api/logout" method="post">
+          <form className="logout row" action="/api/logout" method="post">
+            {user && <span className="muted">{user}</span>}
             <button className="btn small" type="submit">Salir</button>
           </form>
         </div>
