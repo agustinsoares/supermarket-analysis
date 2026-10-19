@@ -31,7 +31,7 @@ export function cropsEnabled(): boolean {
   return activeProvider()?.provider === "gemini" && (process.env.FLYER_CROP ?? "on") !== "off";
 }
 
-export const NO_KEY_MESSAGE = "Falta GEMINI_API_KEY (o ANTHROPIC_API_KEY) en las variables de entorno para leer folletos";
+export const NO_KEY_MESSAGE = "Falta GEMINI_API_KEY (o ANTHROPIC_API_KEY) en las variables de entorno para usar la IA";
 
 // Esquema deliberadamente simple (sin null ni enum): "" y 0 significan «no consta». Se normaliza en flyer-ai.ts.
 const Product = z.object({
@@ -84,12 +84,11 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Lee los productos de un trozo de folleto (imagen o PDF corto). */
 export async function extractProducts(doc: Doc, context: string, wantBoxes = false): Promise<RawProduct[]> {
-  const active = activeProvider();
-  if (!active) throw new Error(NO_KEY_MESSAGE);
   const prompt =
     `${context}\n\nExtrae todos los productos con precio de estas páginas.` +
     (wantBoxes ? "" : "\nNo necesito recortes: devuelve box_2d = [] en todos los productos.");
-  return active.provider === "gemini" ? viaGemini(active.model, doc, prompt) : viaClaude(active.model, doc, prompt);
+  const r = await runTask({ system: SYSTEM, doc, prompt, jsonSchema: JSON_SCHEMA, zod: Extraction, maxOut: 32000 });
+  return r.products;
 }
 
 // ---------------------------------------------------------------- Gemini
@@ -159,25 +158,37 @@ async function geminiFailure(e: unknown, model: string): Promise<Error> {
   return new Error(msg.slice(0, 400));
 }
 
-async function viaGemini(model: string, doc: Doc, prompt: string): Promise<RawProduct[]> {
+// ---------------------------------------------------------------- tareas estructuradas (Gemini o Claude)
+type Task<T> = {
+  system: string;
+  doc?: Doc; // imagen o PDF opcional; si no hay, solo texto
+  prompt: string;
+  jsonSchema: object;
+  zod: z.ZodType<T>;
+  maxOut: number;
+};
+
+async function runTask<T>(task: Task<T>): Promise<T> {
+  const active = activeProvider();
+  if (!active) throw new Error(NO_KEY_MESSAGE);
+  return active.provider === "gemini" ? geminiTask(active.model, task) : claudeTask(active.model, task);
+}
+
+async function geminiTask<T>(model: string, t: Task<T>): Promise<T> {
   const ai = geminiClient();
+  const parts = [...(t.doc ? [{ inlineData: { mimeType: t.doc.mime, data: t.doc.base64 } }] : []), { text: t.prompt }];
   for (let attempt = 1; ; attempt++) {
     try {
       const res = await ai.models.generateContent({
         model,
-        contents: [{ role: "user", parts: [{ inlineData: { mimeType: doc.mime, data: doc.base64 } }, { text: prompt }] }],
-        config: {
-          systemInstruction: SYSTEM,
-          responseMimeType: "application/json",
-          responseJsonSchema: JSON_SCHEMA,
-          maxOutputTokens: 32000,
-        },
+        contents: [{ role: "user", parts }],
+        config: { systemInstruction: t.system, responseMimeType: "application/json", responseJsonSchema: t.jsonSchema, maxOutputTokens: t.maxOut },
       });
       const block = res.promptFeedback?.blockReason;
       if (block) throw new Error(`Gemini bloqueó la petición (${block})`);
       const finish = res.candidates?.[0]?.finishReason;
-      if (finish && finish !== "STOP") throw new Error(`Gemini terminó con ${finish}; prueba con menos páginas`);
-      return parse(res.text);
+      if (finish && finish !== "STOP") throw new Error(`Gemini terminó con ${finish}; prueba con menos contenido`);
+      return parse(res.text, t.zod);
     } catch (e) {
       // Límite de peticiones o sobrecarga: reintenta con espera (cuota gratuita baja).
       if (!(e instanceof ApiError)) throw e;
@@ -190,28 +201,32 @@ async function viaGemini(model: string, doc: Doc, prompt: string): Promise<RawPr
   }
 }
 
-// ---------------------------------------------------------------- Claude
-async function viaClaude(model: string, doc: Doc, prompt: string): Promise<RawProduct[]> {
-  const content: Anthropic.Beta.Messages.BetaContentBlockParam =
-    doc.mime === "application/pdf"
-      ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: doc.base64 } }
-      : { type: "image", source: { type: "base64", media_type: doc.mime as "image/jpeg" | "image/png" | "image/webp", data: doc.base64 } };
+async function claudeTask<T>(model: string, t: Task<T>): Promise<T> {
+  const content: Anthropic.Beta.Messages.BetaContentBlockParam[] = [];
+  if (t.doc) {
+    content.push(
+      t.doc.mime === "application/pdf"
+        ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: t.doc.base64 } }
+        : { type: "image", source: { type: "base64", media_type: t.doc.mime as "image/jpeg" | "image/png" | "image/webp", data: t.doc.base64 } },
+    );
+  }
+  content.push({ type: "text", text: t.prompt });
 
   const res = await new Anthropic().beta.messages.parse({
     model,
-    max_tokens: 16000,
+    max_tokens: Math.min(t.maxOut, 16000),
     betas: ["server-side-fallback-2026-07-01"],
     fallbacks: "default",
-    system: SYSTEM,
-    output_config: { effort: "medium", format: zodOutputFormat(Extraction) },
-    messages: [{ role: "user", content: [content, { type: "text", text: prompt }] }],
+    system: t.system,
+    output_config: { effort: "medium", format: zodOutputFormat(t.zod) },
+    messages: [{ role: "user", content }],
   });
-  if (res.stop_reason === "refusal") throw new Error("Claude rechazó leer esta página");
-  if (!res.parsed_output) throw new Error(`Respuesta incompleta (${res.stop_reason}); prueba con menos páginas`);
-  return res.parsed_output.products;
+  if (res.stop_reason === "refusal") throw new Error("Claude rechazó la petición");
+  if (!res.parsed_output) throw new Error(`Respuesta incompleta (${res.stop_reason}); prueba con menos contenido`);
+  return res.parsed_output as T;
 }
 
-function parse(text: string | undefined): RawProduct[] {
+function parse<T>(text: string | undefined, schema: z.ZodType<T>): T {
   if (!text) throw new Error("La IA no devolvió texto");
   let json: unknown;
   try {
@@ -219,9 +234,56 @@ function parse(text: string | undefined): RawProduct[] {
   } catch {
     throw new Error("La IA devolvió JSON inválido");
   }
-  const r = Extraction.safeParse(json);
+  const r = schema.safeParse(json);
   if (!r.success) throw new Error(`Respuesta con formato inesperado: ${r.error.issues[0]?.message ?? "?"}`);
-  return r.data.products;
+  return r.data;
+}
+
+// ---------------------------------------------------------------- recetas
+const RECIPE_SYSTEM = `Eres un asistente que convierte el texto de una receta de cocina en datos estructurados.
+
+Reglas:
+- title: nombre de la receta.
+- servings: número de raciones o personas (entero); 0 si no se indica.
+- ingredients: una entrada por ingrediente. name: solo el ingrediente (sin cantidad ni unidad ni notas como «picado»); quantity: número (0 si no consta, p. ej. «sal al gusto»); unit: una de g, kg, ml, dl, l, cda, cdta, ud o "" si no aplica. Convierte fracciones a decimales (1/2 = 0.5).
+- steps: los pasos de preparación, uno por línea, numerados («1. …»). Si el texto no trae pasos, "".
+- Mantén el idioma original del texto en los nombres. No inventes ingredientes ni pasos.`;
+
+const RecipeExtraction = z.object({
+  title: z.string(),
+  servings: z.number(),
+  ingredients: z.array(z.object({ name: z.string(), quantity: z.number(), unit: z.string() })),
+  steps: z.string(),
+});
+export type ExtractedRecipe = z.infer<typeof RecipeExtraction>;
+
+const RECIPE_JSON_SCHEMA = {
+  type: "object",
+  properties: {
+    title: { type: "string" },
+    servings: { type: "number" },
+    ingredients: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { name: { type: "string" }, quantity: { type: "number" }, unit: { type: "string" } },
+        required: ["name", "quantity", "unit"],
+      },
+    },
+    steps: { type: "string" },
+  },
+  required: ["title", "servings", "ingredients", "steps"],
+};
+
+/** Convierte el texto pegado de una receta en datos para revisar antes de guardar. */
+export function extractRecipe(text: string): Promise<ExtractedRecipe> {
+  return runTask({
+    system: RECIPE_SYSTEM,
+    prompt: `Texto de la receta:\n\n${text.slice(0, 20000)}`,
+    jsonSchema: RECIPE_JSON_SCHEMA,
+    zod: RecipeExtraction,
+    maxOut: 8000,
+  });
 }
 
 /** Comprobación rápida de clave y modelo (para el botón «Probar IA»). */

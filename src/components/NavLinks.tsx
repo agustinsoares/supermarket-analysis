@@ -7,6 +7,9 @@ const LINKS = [
   { href: "/", label: "Comparar" },
   { href: "/products", label: "Productos" },
   { href: "/flyers", label: "Folletos" },
+  { href: "/shopping", label: "Lista de la compra" },
+  { href: "/pantry", label: "Despensa" },
+  { href: "/recipes", label: "Recetas" },
 ];
 
 export default function NavLinks() {
