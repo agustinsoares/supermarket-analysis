@@ -1,8 +1,9 @@
 import { PDFDocument } from "pdf-lib";
 import { CATEGORIES } from "./config";
-import { extractProducts, type Doc } from "./llm";
+import { cropToWebp, normalizeImage, validBox } from "./crop";
+import { cropsEnabled, extractProducts, type Doc } from "./llm";
 import { pricePerKg } from "./product";
-import { downloadFromBucket, FLYER_BUCKET } from "./storage";
+import { downloadFromBucket, FLYER_BUCKET, removeProductImages, uploadProductImage } from "./storage";
 import { db } from "./supabase";
 
 const PDF_PAGES_PER_UNIT = 3;
@@ -28,16 +29,38 @@ async function buildPlan(files: FlyerFile[]): Promise<Unit[]> {
   return units;
 }
 
-async function loadUnit(file: FlyerFile, unit: Unit): Promise<Doc> {
+/** `raster` es la imagen exacta que ve la IA (solo imágenes, no PDF): de ahí salen los recortes. */
+async function loadUnit(file: FlyerFile, unit: Unit): Promise<{ doc: Doc; raster: Buffer | null }> {
   const bytes = await downloadFromBucket(FLYER_BUCKET, file.path);
   if (unit.kind === "pdf") {
     const src = await PDFDocument.load(bytes, { ignoreEncryption: true });
     const out = await PDFDocument.create();
     const pages = await out.copyPages(src, Array.from({ length: unit.to - unit.from }, (_, k) => unit.from + k));
     pages.forEach((p) => out.addPage(p));
-    return { mime: "application/pdf", base64: Buffer.from(await out.save()).toString("base64") };
+    return { doc: { mime: "application/pdf", base64: Buffer.from(await out.save()).toString("base64") }, raster: null };
   }
-  return { mime: file.mime, base64: bytes.toString("base64") };
+  const raster = await normalizeImage(bytes);
+  return { doc: { mime: file.mime, base64: raster.toString("base64") }, raster };
+}
+
+/** Recorta y sube la foto de cada producto (máx. 6 a la vez). Un recorte fallido no detiene el análisis. */
+async function cropAll(raster: Buffer, boxes: (number[] | undefined)[]): Promise<(string | null)[]> {
+  const out: (string | null)[] = new Array(boxes.length).fill(null);
+  let next = 0;
+  const worker = async () => {
+    while (next < boxes.length) {
+      const i = next++;
+      try {
+        const box = validBox(boxes[i]);
+        const webp = box ? await cropToWebp(raster, box) : null;
+        out[i] = webp ? await uploadProductImage(webp) : null;
+      } catch {
+        out[i] = null;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(6, boxes.length) }, worker));
+  return out;
 }
 
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -68,7 +91,9 @@ export async function analyzeFlyer(flyerId: number) {
       plan = await buildPlan(files);
       done = 0;
       found = 0;
+      const { data: old } = await sb.from("items").select("image").eq("flyer_id", flyerId).eq("status", "draft");
       await sb.from("items").delete().eq("flyer_id", flyerId).eq("status", "draft");
+      await removeProductImages((old ?? []).map((r) => r.image as string | null));
       await touch({ plan, units_total: plan.length, units_done: 0, items_found: 0, error: null, status: "analyzing" });
     } else {
       await touch({ status: "analyzing", error: null });
@@ -79,16 +104,21 @@ export async function analyzeFlyer(flyerId: number) {
 
     for (let i = done; i < plan.length; i++) {
       const unit = plan[i];
-      const products = await extractProducts(await loadUnit(files[unit.file], unit), context);
+      const { doc, raster } = await loadUnit(files[unit.file], unit);
+      const crops = !!raster && cropsEnabled();
+      const products = await extractProducts(doc, context, crops);
 
       const seen = new Set<string>();
-      const rows = products
+      const kept = products
         .filter((p) => p.name.trim() && p.price > 0 && p.price < 5000)
         .filter((p) => {
           const k = `${p.name.toLowerCase()}|${p.price}`;
           return seen.has(k) ? false : (seen.add(k), true);
-        })
-        .map((p) => {
+        });
+
+      const images = crops && raster ? await cropAll(raster, kept.map((p) => p.box_2d)) : kept.map(() => null);
+      const rows = kept
+        .map((p, idx) => {
           const grams = p.grams > 0 ? Math.round(p.grams) : null;
           const date = (v: string) => (DATE.test(v) ? v : null);
           return {
@@ -96,6 +126,7 @@ export async function analyzeFlyer(flyerId: number) {
             name: p.name.trim().slice(0, 200),
             brand: p.brand.trim().slice(0, 100) || null,
             category: normalizeCategory(p.category),
+            image: images[idx],
             grams,
             current_price: p.price,
             current_unit_price: pricePerKg(p.price, grams),
@@ -111,7 +142,10 @@ export async function analyzeFlyer(flyerId: number) {
 
       if (rows.length) {
         const { error: insErr } = await sb.from("items").insert(rows);
-        if (insErr) throw new Error(insErr.message);
+        if (insErr) {
+          await removeProductImages(images); // no dejar recortes huérfanos
+          throw new Error(insErr.message);
+        }
       }
       found += rows.length;
       await touch({ units_done: i + 1, items_found: found });

@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { isAuthorized } from "@/lib/auth";
-import { FLYER_BUCKET, removeFromBucket } from "@/lib/storage";
+import { FLYER_BUCKET, removeFromBucket, removeProductImages } from "@/lib/storage";
 import { db } from "@/lib/supabase";
 
 type Ctx = { params: Promise<{ id: string }> };
@@ -15,7 +15,9 @@ export async function DELETE(req: Request, { params }: Ctx) {
   const { data: flyer } = await sb.from("flyers").select("files").eq("id", id).maybeSingle();
   if (!flyer) return NextResponse.json({ error: "Folleto no encontrado" }, { status: 404 });
 
+  const { data: drafts } = await sb.from("items").select("image").eq("flyer_id", id).eq("status", "draft");
   await sb.from("items").delete().eq("flyer_id", id).eq("status", "draft");
+  await removeProductImages((drafts ?? []).map((r) => r.image as string | null));
   const { error } = await sb.from("flyers").delete().eq("id", id);
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
   await removeFromBucket(FLYER_BUCKET, (flyer.files as { path: string }[]).map((f) => f.path));

@@ -33,15 +33,16 @@ Stack: Next.js 15 (App Router) · Supabase · Vercel · API de [Kassalapp](https
 | `KASSAL_TOKEN` | Token de la API de Kassalapp |
 | `SYNC_SECRET` | Firma las sesiones (cambiarla cierra todas) y valida `Authorization: Bearer` en la API |
 | `GEMINI_API_KEY` | Para leer folletos con Gemini (aistudio.google.com/apikey) |
-| `GEMINI_MODEL` | Opcional; por defecto `gemini-2.5-flash` (confirma el nombre vigente en AI Studio) |
+| `GEMINI_MODEL` | Opcional; por defecto `gemini-3.8-flash` (Google retira modelos: si falla, la web lista los disponibles) |
 | `ANTHROPIC_API_KEY` | Alternativa: leer folletos con Claude |
 | `ANTHROPIC_MODEL` | Opcional; por defecto `claude-opus-5-5` |
+| `FLYER_CROP` | Opcional: `off` desactiva los recortes de producto (por defecto activos con Gemini) |
 | `LLM_PROVIDER` | Opcional: `gemini` o `anthropic`. Si no, se usa el que tenga clave (Gemini primero) |
 
 ## Notas
 - El análisis de folletos corre en segundo plano (`maxDuration` 300 s). Si Vercel lo corta, el folleto queda «Interrumpido» y se reanuda donde se quedó.
 - En Folletos hay un botón «Probar IA» que comprueba la clave y el modelo antes de subir nada.
-- Los productos leídos de folletos no llevan imagen (se puede añadir al editarlos).
+- **Recortes de producto**: con Gemini y folletos subidos como **imágenes**, la IA devuelve la caja de la foto de cada producto y el servidor la recorta (sharp) y la guarda como imagen del producto. Cajas inválidas (vacías, de página entera, diminutas) se descartan. En PDF o con Claude no se recorta. `FLYER_CROP=off` lo desactiva. Los recortes de borradores descartados se borran del almacenamiento.
 
 ## Siguientes pasos
 - Lista de la compra y «dónde me conviene comprar todo».

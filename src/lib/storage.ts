@@ -48,3 +48,18 @@ export function pathFromPublicUrl(url: string | null): string | null {
   const i = url.indexOf(marker);
   return i === -1 ? null : decodeURIComponent(url.slice(i + marker.length).split("?")[0]);
 }
+
+/** Sube una imagen de producto (p. ej. un recorte de folleto) y devuelve su URL pública. */
+export async function uploadProductImage(buf: Buffer, contentType = "image/webp"): Promise<string> {
+  const day = new Date().toISOString().slice(0, 10);
+  const path = `${day}/${randomUUID()}.webp`;
+  const { error } = await db().storage.from(IMAGE_BUCKET).upload(path, buf, { contentType, upsert: false });
+  if (error) throw new Error(`No se pudo subir el recorte: ${error.message}`);
+  return db().storage.from(IMAGE_BUCKET).getPublicUrl(path).data.publicUrl;
+}
+
+/** Borra del almacenamiento las imágenes de producto a partir de sus URLs públicas. */
+export async function removeProductImages(urls: (string | null | undefined)[]) {
+  const paths = urls.map((u) => pathFromPublicUrl(u ?? null)).filter((p): p is string => !!p);
+  await removeFromBucket(IMAGE_BUCKET, paths);
+}

@@ -22,8 +22,13 @@ export function activeProvider(): { provider: Provider; model: string } | null {
   if (provider === "anthropic" && !process.env.ANTHROPIC_API_KEY) return null;
   return {
     provider,
-    model: provider === "gemini" ? process.env.GEMINI_MODEL || "gemini-2.5-flash" : process.env.ANTHROPIC_MODEL || "claude-opus-5-5",
+    model: provider === "gemini" ? process.env.GEMINI_MODEL || "gemini-3.8-flash" : process.env.ANTHROPIC_MODEL || "claude-opus-5-5",
   };
+}
+
+/** Recortar la foto de cada producto: solo con Gemini (da cajas fiables) y si FLYER_CROP no es "off". */
+export function cropsEnabled(): boolean {
+  return activeProvider()?.provider === "gemini" && (process.env.FLYER_CROP ?? "on") !== "off";
 }
 
 export const NO_KEY_MESSAGE = "Falta GEMINI_API_KEY (o ANTHROPIC_API_KEY) en las variables de entorno para leer folletos";
@@ -38,6 +43,7 @@ const Product = z.object({
   notes: z.string(),
   valid_from: z.string(),
   valid_to: z.string(),
+  box_2d: z.array(z.number()),
 });
 const Extraction = z.object({ products: z.array(Product) });
 export type RawProduct = z.infer<typeof Product>;
@@ -52,8 +58,9 @@ const JSON_SCHEMA = {
         properties: {
           name: { type: "string" }, brand: { type: "string" }, price: { type: "number" }, grams: { type: "number" },
           category: { type: "string" }, notes: { type: "string" }, valid_from: { type: "string" }, valid_to: { type: "string" },
+          box_2d: { type: "array", items: { type: "number" } },
         },
-        required: ["name", "brand", "price", "grams", "category", "notes", "valid_from", "valid_to"],
+        required: ["name", "brand", "price", "grams", "category", "notes", "valid_from", "valid_to", "box_2d"],
       },
     },
   },
@@ -70,15 +77,18 @@ Reglas:
 - category: exactamente una de estas categorías: ${CATEGORIES.join(" | ")}. Si ninguna encaja, "Otros".
 - valid_from / valid_to: fechas YYYY-MM-DD solo si el folleto las indica para ese producto o para la página; si no, "".
 - notes: condiciones de la oferta ("2 for 50", "med Trumf"…); "" si no hay.
+- box_2d: [ymin, xmin, ymax, xmax] normalizado de 0 a 1000 respecto a la imagen, que encierra SOLO la foto del producto (el envase o el producto en sí). Sin el precio, sin textos ni etiquetas, sin sellos y sin otros productos. Si no hay una foto clara del producto o no puedes delimitarla bien, [].
 - No inventes datos. Si un dato no se ve, usa "" (texto) o 0 (número). Si hay dudas sobre el precio, omite el producto.`;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Lee los productos de un trozo de folleto (imagen o PDF corto). */
-export async function extractProducts(doc: Doc, context: string): Promise<RawProduct[]> {
+export async function extractProducts(doc: Doc, context: string, wantBoxes = false): Promise<RawProduct[]> {
   const active = activeProvider();
   if (!active) throw new Error(NO_KEY_MESSAGE);
-  const prompt = `${context}\n\nExtrae todos los productos con precio de estas páginas.`;
+  const prompt =
+    `${context}\n\nExtrae todos los productos con precio de estas páginas.` +
+    (wantBoxes ? "" : "\nNo necesito recortes: devuelve box_2d = [] en todos los productos.");
   return active.provider === "gemini" ? viaGemini(active.model, doc, prompt) : viaClaude(active.model, doc, prompt);
 }
 
@@ -88,6 +98,39 @@ function geminiClient() {
     apiKey: process.env.GEMINI_API_KEY,
     ...(process.env.GEMINI_BASE_URL ? { httpOptions: { baseUrl: process.env.GEMINI_BASE_URL } } : {}),
   });
+}
+
+/** Extrae el mensaje legible de un ApiError de Google (que llega como JSON en texto). */
+function cleanApiMessage(e: unknown): string {
+  const raw = e instanceof Error ? e.message : String(e);
+  try {
+    return JSON.parse(raw)?.error?.message ?? raw;
+  } catch {
+    return raw;
+  }
+}
+
+/** Convierte un error de Gemini en uno útil; si el modelo no existe, lista los que sí tiene tu clave. */
+async function geminiFailure(e: unknown, model: string): Promise<Error> {
+  const msg = cleanApiMessage(e);
+  if (e instanceof ApiError && e.status === 404) {
+    let hint = "";
+    try {
+      const names: string[] = [];
+      let seen = 0;
+      for await (const m of await geminiClient().models.list()) {
+        if (++seen > 300) break;
+        const n = (m.name ?? "").replace(/^models\//, "");
+        const usable = /^gemini-\d/.test(n) && !/(tts|image|embedding|live|audio|robotics|computer)/.test(n);
+        if (usable && (m.supportedActions ?? []).includes("generateContent")) names.push(n);
+      }
+      if (names.length) hint = ` Modelos disponibles con tu clave: ${names.slice(0, 8).join(", ")}. Pon uno en GEMINI_MODEL (Vercel) y redespliega.`;
+    } catch {
+      /* sin lista: nos quedamos con el mensaje de Google */
+    }
+    return new Error(`El modelo «${model}» no está disponible. ${msg}${hint}`.slice(0, 480));
+  }
+  return new Error(msg.slice(0, 400));
 }
 
 async function viaGemini(model: string, doc: Doc, prompt: string): Promise<RawProduct[]> {
@@ -112,7 +155,7 @@ async function viaGemini(model: string, doc: Doc, prompt: string): Promise<RawPr
     } catch (e) {
       // Límite de peticiones o sobrecarga: reintenta con espera (cuota gratuita baja).
       const retryable = e instanceof ApiError && (e.status === 429 || e.status === 503);
-      if (!retryable || attempt >= 4) throw e;
+      if (!retryable || attempt >= 4) throw e instanceof ApiError ? await geminiFailure(e, model) : e;
       await sleep(attempt * 20_000);
     }
   }
@@ -165,6 +208,7 @@ export async function pingModel(): Promise<{ provider: Provider; model: string; 
     }
     return { ...active, ok: true };
   } catch (e) {
-    return { ...active, ok: false, error: e instanceof Error ? e.message.slice(0, 300) : String(e) };
+    const error = active.provider === "gemini" && e instanceof ApiError ? (await geminiFailure(e, active.model)).message : e instanceof Error ? e.message.slice(0, 300) : String(e);
+    return { ...active, ok: false, error };
   }
 }
