@@ -33,7 +33,7 @@ Stack: Next.js 15 (App Router) · Supabase · Vercel · API de [Kassalapp](https
 | `KASSAL_TOKEN` | Token de la API de Kassalapp |
 | `SYNC_SECRET` | Firma las sesiones (cambiarla cierra todas) y valida `Authorization: Bearer` en la API |
 | `GEMINI_API_KEY` | Para leer folletos con Gemini (aistudio.google.com/apikey) |
-| `GEMINI_MODEL` | Opcional; por defecto `gemini-2.5-flash` (confirma el nombre vigente en AI Studio) |
+| `GEMINI_MODEL` | Opcional; por defecto `gemini-3.8-flash` (Google retira modelos: si falla, la web lista los disponibles) |
 | `ANTHROPIC_API_KEY` | Alternativa: leer folletos con Claude |
 | `ANTHROPIC_MODEL` | Opcional; por defecto `claude-opus-5-5` |
 | `LLM_PROVIDER` | Opcional: `gemini` o `anthropic`. Si no, se usa el que tenga clave (Gemini primero) |

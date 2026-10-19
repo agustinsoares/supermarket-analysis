@@ -22,7 +22,7 @@ export function activeProvider(): { provider: Provider; model: string } | null {
   if (provider === "anthropic" && !process.env.ANTHROPIC_API_KEY) return null;
   return {
     provider,
-    model: provider === "gemini" ? process.env.GEMINI_MODEL || "gemini-2.5-flash" : process.env.ANTHROPIC_MODEL || "claude-opus-5-5",
+    model: provider === "gemini" ? process.env.GEMINI_MODEL || "gemini-3.8-flash" : process.env.ANTHROPIC_MODEL || "claude-opus-5-5",
   };
 }
 
@@ -90,6 +90,39 @@ function geminiClient() {
   });
 }
 
+/** Extrae el mensaje legible de un ApiError de Google (que llega como JSON en texto). */
+function cleanApiMessage(e: unknown): string {
+  const raw = e instanceof Error ? e.message : String(e);
+  try {
+    return JSON.parse(raw)?.error?.message ?? raw;
+  } catch {
+    return raw;
+  }
+}
+
+/** Convierte un error de Gemini en uno útil; si el modelo no existe, lista los que sí tiene tu clave. */
+async function geminiFailure(e: unknown, model: string): Promise<Error> {
+  const msg = cleanApiMessage(e);
+  if (e instanceof ApiError && e.status === 404) {
+    let hint = "";
+    try {
+      const names: string[] = [];
+      let seen = 0;
+      for await (const m of await geminiClient().models.list()) {
+        if (++seen > 300) break;
+        const n = (m.name ?? "").replace(/^models\//, "");
+        const usable = /^gemini-\d/.test(n) && !/(tts|image|embedding|live|audio|robotics|computer)/.test(n);
+        if (usable && (m.supportedActions ?? []).includes("generateContent")) names.push(n);
+      }
+      if (names.length) hint = ` Modelos disponibles con tu clave: ${names.slice(0, 8).join(", ")}. Pon uno en GEMINI_MODEL (Vercel) y redespliega.`;
+    } catch {
+      /* sin lista: nos quedamos con el mensaje de Google */
+    }
+    return new Error(`El modelo «${model}» no está disponible. ${msg}${hint}`.slice(0, 480));
+  }
+  return new Error(msg.slice(0, 400));
+}
+
 async function viaGemini(model: string, doc: Doc, prompt: string): Promise<RawProduct[]> {
   const ai = geminiClient();
   for (let attempt = 1; ; attempt++) {
@@ -112,7 +145,7 @@ async function viaGemini(model: string, doc: Doc, prompt: string): Promise<RawPr
     } catch (e) {
       // Límite de peticiones o sobrecarga: reintenta con espera (cuota gratuita baja).
       const retryable = e instanceof ApiError && (e.status === 429 || e.status === 503);
-      if (!retryable || attempt >= 4) throw e;
+      if (!retryable || attempt >= 4) throw e instanceof ApiError ? await geminiFailure(e, model) : e;
       await sleep(attempt * 20_000);
     }
   }
@@ -165,6 +198,7 @@ export async function pingModel(): Promise<{ provider: Provider; model: string; 
     }
     return { ...active, ok: true };
   } catch (e) {
-    return { ...active, ok: false, error: e instanceof Error ? e.message.slice(0, 300) : String(e) };
+    const error = active.provider === "gemini" && e instanceof ApiError ? (await geminiFailure(e, active.model)).message : e instanceof Error ? e.message.slice(0, 300) : String(e);
+    return { ...active, ok: false, error };
   }
 }
