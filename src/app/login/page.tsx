@@ -6,7 +6,8 @@ import { api } from "@/lib/client";
 
 export default function Login() {
   const router = useRouter();
-  const [secret, setSecret] = useState("");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -15,7 +16,7 @@ export default function Login() {
     setBusy(true);
     setError("");
     try {
-      await api("/api/login", { method: "POST", json: { secret } });
+      await api("/api/login", { method: "POST", json: { username, password } });
       router.replace("/");
       router.refresh();
     } catch (err) {
@@ -32,11 +33,17 @@ export default function Login() {
           <p className="muted">Rema 1000 · Kiwi · Extra — Solheim Nord</p>
         </div>
         <label className="field">
-          <span>Clave de acceso</span>
-          <input type="password" autoComplete="current-password" autoFocus required value={secret} onChange={(e) => setSecret(e.target.value)} />
+          <span>Usuario</span>
+          <input type="text" name="username" autoComplete="username" autoCapitalize="none" autoCorrect="off" spellCheck={false}
+            autoFocus required maxLength={50} value={username} onChange={(e) => setUsername(e.target.value)} />
+        </label>
+        <label className="field">
+          <span>Contraseña</span>
+          <input type="password" name="password" autoComplete="current-password" required maxLength={200}
+            value={password} onChange={(e) => setPassword(e.target.value)} />
         </label>
         {error && <p className="err" role="alert">{error}</p>}
-        <button className="btn primary" disabled={busy || !secret}>{busy ? "Entrando…" : "Entrar"}</button>
+        <button className="btn primary" disabled={busy || !username || !password}>{busy ? "Entrando…" : "Entrar"}</button>
       </form>
     </div>
   );
