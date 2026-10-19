@@ -26,6 +26,11 @@ export function activeProvider(): { provider: Provider; model: string } | null {
   };
 }
 
+/** Recortar la foto de cada producto: solo con Gemini (da cajas fiables) y si FLYER_CROP no es "off". */
+export function cropsEnabled(): boolean {
+  return activeProvider()?.provider === "gemini" && (process.env.FLYER_CROP ?? "on") !== "off";
+}
+
 export const NO_KEY_MESSAGE = "Falta GEMINI_API_KEY (o ANTHROPIC_API_KEY) en las variables de entorno para leer folletos";
 
 // Esquema deliberadamente simple (sin null ni enum): "" y 0 significan «no consta». Se normaliza en flyer-ai.ts.
@@ -38,6 +43,7 @@ const Product = z.object({
   notes: z.string(),
   valid_from: z.string(),
   valid_to: z.string(),
+  box_2d: z.array(z.number()),
 });
 const Extraction = z.object({ products: z.array(Product) });
 export type RawProduct = z.infer<typeof Product>;
@@ -52,8 +58,9 @@ const JSON_SCHEMA = {
         properties: {
           name: { type: "string" }, brand: { type: "string" }, price: { type: "number" }, grams: { type: "number" },
           category: { type: "string" }, notes: { type: "string" }, valid_from: { type: "string" }, valid_to: { type: "string" },
+          box_2d: { type: "array", items: { type: "number" } },
         },
-        required: ["name", "brand", "price", "grams", "category", "notes", "valid_from", "valid_to"],
+        required: ["name", "brand", "price", "grams", "category", "notes", "valid_from", "valid_to", "box_2d"],
       },
     },
   },
@@ -70,15 +77,18 @@ Reglas:
 - category: exactamente una de estas categorías: ${CATEGORIES.join(" | ")}. Si ninguna encaja, "Otros".
 - valid_from / valid_to: fechas YYYY-MM-DD solo si el folleto las indica para ese producto o para la página; si no, "".
 - notes: condiciones de la oferta ("2 for 50", "med Trumf"…); "" si no hay.
+- box_2d: [ymin, xmin, ymax, xmax] normalizado de 0 a 1000 respecto a la imagen, que encierra SOLO la foto del producto (el envase o el producto en sí). Sin el precio, sin textos ni etiquetas, sin sellos y sin otros productos. Si no hay una foto clara del producto o no puedes delimitarla bien, [].
 - No inventes datos. Si un dato no se ve, usa "" (texto) o 0 (número). Si hay dudas sobre el precio, omite el producto.`;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Lee los productos de un trozo de folleto (imagen o PDF corto). */
-export async function extractProducts(doc: Doc, context: string): Promise<RawProduct[]> {
+export async function extractProducts(doc: Doc, context: string, wantBoxes = false): Promise<RawProduct[]> {
   const active = activeProvider();
   if (!active) throw new Error(NO_KEY_MESSAGE);
-  const prompt = `${context}\n\nExtrae todos los productos con precio de estas páginas.`;
+  const prompt =
+    `${context}\n\nExtrae todos los productos con precio de estas páginas.` +
+    (wantBoxes ? "" : "\nNo necesito recortes: devuelve box_2d = [] en todos los productos.");
   return active.provider === "gemini" ? viaGemini(active.model, doc, prompt) : viaClaude(active.model, doc, prompt);
 }
 

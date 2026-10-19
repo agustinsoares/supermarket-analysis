@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { isAuthorized } from "@/lib/auth";
+import { removeProductImages } from "@/lib/storage";
 import { db } from "@/lib/supabase";
 
 const bodySchema = z.object({
@@ -19,6 +20,14 @@ export async function POST(req: Request) {
   const { action, ids, flyerId } = parsed.data;
   const sb = db();
 
+  // Al descartar, guardamos las rutas de los recortes para borrarlos del almacenamiento después.
+  let discardedImages: (string | null)[] = [];
+  if (action === "discard") {
+    let sel = sb.from("items").select("image").eq("status", "draft");
+    sel = ids?.length ? sel.in("id", ids) : sel.eq("flyer_id", flyerId as number);
+    discardedImages = ((await sel).data ?? []).map((r) => r.image as string | null);
+  }
+
   let q = action === "approve"
     ? sb.from("items").update({ status: "active", locked: true, updated_at: new Date().toISOString() })
     : sb.from("items").delete();
@@ -27,6 +36,8 @@ export async function POST(req: Request) {
 
   const { data, error } = await q.select("id,current_price");
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
+
+  if (action === "discard") await removeProductImages(discardedImages);
 
   if (action === "approve" && data?.length) {
     await sb.from("price_history").insert(
